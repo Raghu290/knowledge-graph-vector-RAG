@@ -1,0 +1,317 @@
+# ============================================
+# Investor Relationship Extraction & KG Notebook (Gemini)
+# ============================================
+
+# -------------------------
+# 1. Setup & Imports
+# -------------------------
+import re, uuid, json, requests, datetime
+from typing import List, Dict, Any, Optional
+from rdflib import Graph, Namespace, URIRef, Literal
+from rdflib.namespace import RDF, XSD
+from bs4 import BeautifulSoup
+import yfinance as yf
+from fastapi import FastAPI
+from pydantic import BaseModel
+import uvicorn
+import spacy
+from google import genai
+from google.genai import types
+
+# Load spaCy NER
+nlp = spacy.load("en_core_web_sm")
+
+# Initialize Gemini client
+client = genai.Client()
+
+# -------------------------
+# 2. Configuration
+# -------------------------
+COMPANY_TICKER_MAP = {
+    "BlackRock": "BLK",
+    "Apple": "AAPL",
+    "Microsoft": "MSFT",
+    "Tesla": "TSLA",
+    "Amazon": "AMZN",
+    "Company B": "B"
+}
+
+# -------------------------
+# 3. Alias Mapping & Normalization
+# -------------------------
+RELATIONSHIP_SYNONYMS = {
+    "majority": ["Principle stakeholder", "Principal stakeholder", "Major stakeholder",
+                 "majority stakeholder", "voting control", "voting majority",
+                 "buyout", "Acquisition", "Acquired", "controlling interest", "equity control"],
+    "minority": ["Equity stake","Invest along with","Small shareholding","minority interest",
+                 "limited influence","passive investment as minority"]
+}
+ALL_SYNONYMS = [s.lower() for lst in RELATIONSHIP_SYNONYMS.values() for s in lst]
+
+def detect_relationship_synonyms(text: str) -> List[str]:
+    found = []
+    text_l = text.lower()
+    for syn in ALL_SYNONYMS:
+        if syn in text_l:
+            found.append(syn)
+    return list(set(found))
+
+def normalize_tag(synonyms: List[str], percentage: Optional[float] = None) -> str:
+    for syn in synonyms:
+        for tag, tag_syns in RELATIONSHIP_SYNONYMS.items():
+            if syn in [s.lower() for s in tag_syns]:
+                if percentage is not None:
+                    return "majority" if percentage >= 50 else "minority"
+                return tag
+    if percentage is not None:
+        return "majority" if percentage >= 50 else "minority"
+    return "unknown"
+
+# -------------------------
+# 4. Target Company Extraction using spaCy
+# -------------------------
+def extract_target_company(query: str) -> str:
+    doc = nlp(query)
+    for ent in doc.ents:
+        if ent.label_ == "ORG":
+            return ent.text
+    return "Company B"  # fallback
+
+def get_ticker(company_name: str) -> Optional[str]:
+    company_name = company_name.strip()
+    ticker = COMPANY_TICKER_MAP.get(company_name)
+    if ticker:
+        return ticker
+    return None
+
+# -------------------------
+# 5. Yahoo Finance Ownership
+# -------------------------
+def fetch_yahoo_ownership(ticker: str) -> List[Dict[str,Any]]:
+    try:
+        ticker_obj = yf.Ticker(ticker)
+        holders = ticker_obj.institutional_holders
+        if holders is None:
+            return []
+        result = []
+        for _, row in holders.iterrows():
+            investor = row.get("Holder")
+            pct = row.get("% Out")
+            pct_val = float(str(pct).replace("%","")) if pct else None
+            result.append({
+                "investor": investor,
+                "company": ticker,
+                "percentage": pct_val,
+                "source": "Yahoo Finance",
+                "raw_text": f"{investor} owns {pct_val}% of {ticker}",
+                "investment_date": None
+            })
+        return result
+    except:
+        return []
+
+# -------------------------
+# 6. Fintel HTML Scrape
+# -------------------------
+def fetch_fintel_ownership(ticker: str) -> List[Dict[str,Any]]:
+    url = f"https://fintel.io/so/us/{ticker.lower()}"
+    try:
+        r = requests.get(url)
+        soup = BeautifulSoup(r.text, "html.parser")
+        table = soup.find("table")
+        if not table:
+            return []
+        result = []
+        for row in table.find_all("tr")[1:]:
+            cols = row.find_all("td")
+            if len(cols) < 3:
+                continue
+            investor = cols[0].get_text(strip=True)
+            pct_text = cols[1].get_text(strip=True).replace("%","")
+            try:
+                pct_val = float(pct_text)
+            except:
+                pct_val = None
+            result.append({
+                "investor": investor,
+                "company": ticker,
+                "percentage": pct_val,
+                "source": "Fintel",
+                "raw_text": " | ".join([c.get_text(strip=True) for c in cols]),
+                "investment_date": None
+            })
+        return result
+    except:
+        return []
+
+# -------------------------
+# 7. Google Gemini News
+# -------------------------
+def fetch_google_news(company_name: str) -> List[Dict[str,Any]]:
+    """
+    Use Google Gemini API to fetch news articles related to target company.
+    """
+    try:
+        google_search_tool = types.Tool(
+            google_search=types.GoogleSearch()
+        )
+        config = types.GenerateContentConfig(tools=[google_search_tool])
+
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=f"Latest news on {company_name} stock and ownership",
+            config=config
+        )
+
+        raw_text = response.text
+        # Mock parsing into articles
+        articles = []
+        for i, line in enumerate(raw_text.split("\n")[:3]):
+            if line.strip():
+                articles.append({
+                    "title": f"News {i+1} for {company_name}",
+                    "url": f"https://example.com/article-{i+1}",
+                    "text": line.strip(),
+                    "date": "2024-05-15"
+                })
+        return articles
+    except Exception as e:
+        print("Gemini search failed, using fallback mock:", e)
+        return [
+            {"title": f"News 1 for {company_name}",
+             "url": "https://example.com/article-1",
+             "text": f"{company_name} shows that BlackRock completed a majority buyout acquiring 55%.",
+             "date": "2024-05-15"},
+            {"title": f"News 2 for {company_name}",
+             "url": "https://example.com/article-2",
+             "text": f"{company_name} indicates Investor A invested 10% alongside Investor B.",
+             "date": "2024-05-15"}
+        ]
+
+# -------------------------
+# 8. Merge & Normalize
+# -------------------------
+def merge_ownership_data(yahoo_list, fintel_list, news_list) -> List[Dict[str,Any]]:
+    merged = {}
+    for src in [yahoo_list, fintel_list]:
+        for e in src:
+            key = e['investor'].lower()
+            if key in merged:
+                if e['percentage'] and (merged[key]['percentage'] is None or e['percentage']>merged[key]['percentage']):
+                    merged[key]['percentage'] = e['percentage']
+                merged[key]['raw_text'] += " | " + e['raw_text']
+            else:
+                merged[key] = e
+    for article in news_list:
+        for key in merged.keys():
+            if key in article['text'].lower():
+                merged[key]['raw_text'] += " | " + article['text']
+                merged[key]['source_url'] = merged[key].get('source_url',[])+[article['url']]
+                merged[key]['investment_date'] = article.get('date', merged[key]['investment_date'])
+    for key, e in merged.items():
+        synonyms = detect_relationship_synonyms(e['raw_text'])
+        e['relationship_tag'] = normalize_tag(synonyms, e['percentage'])
+        e['relationship_synonyms'] = synonyms
+    return list(merged.values())
+
+# -------------------------
+# 9. RDF Generation
+# -------------------------
+EX = Namespace("http://example.com/onto/")
+EXR = Namespace("http://example.com/resource/")
+
+def json_to_rdf(event: Dict[str,Any]) -> Graph:
+    g = Graph()
+    g.bind("ex", EX)
+    g.bind("exr", EXR)
+    actor_uri = URIRef(EXR + re.sub(r'\W+','-', (event['investor'] or 'unknown').lower()))
+    target_uri = URIRef(EXR + re.sub(r'\W+','-', (event['company'] or 'unknown').lower()))
+    g.add((actor_uri, RDF.type, EX.Investor))
+    g.add((target_uri, RDF.type, EX.Company))
+    event_uri = URIRef(EXR + f"OwnershipRelationship_{uuid.uuid4().hex[:6]}")
+    g.add((event_uri, RDF.type, EX.OwnershipRelationship))
+    g.add((event_uri, EX.investor, actor_uri))
+    g.add((event_uri, EX.company, target_uri))
+    if event['percentage'] is not None:
+        g.add((event_uri, EX.percentage, Literal(float(event['percentage']), datatype=XSD.decimal)))
+    g.add((event_uri, EX.relationshipTag, Literal(event['relationship_tag'])))
+    for syn in event['relationship_synonyms']:
+        g.add((event_uri, EX.relationshipSynonym, Literal(syn)))
+    if event.get('source_url'):
+        for url in event['source_url']:
+            g.add((event_uri, EX.sourceURL, URIRef(url)))
+    if event.get('investment_date'):
+        g.add((event_uri, EX.investmentDate, Literal(event['investment_date'], datatype=XSD.date)))
+    return g
+
+# -------------------------
+# 10. Weaviate Payload
+# -------------------------
+def build_weaviate_object(event: Dict[str,Any], kg_ids: List[str], kg_triples: List[str]) -> Dict[str,Any]:
+    obj = {
+        "class": "InvestorRelationship",
+        "properties": {
+            "investor": event['investor'],
+            "company": event['company'],
+            "relationship_tag": event['relationship_tag'],
+            "relationship_synonyms": event['relationship_synonyms'],
+            "percentage": event['percentage'],
+            "source_url": event.get('source_url',[]),
+            "raw_text": event['raw_text'],
+            "investment_date": event.get('investment_date'),
+            "kg_triples": kg_triples,
+            "kg_ids": kg_ids
+        }
+    }
+    return obj
+
+# -------------------------
+# 11. Full Pipeline
+# -------------------------
+def process_query(query: str) -> Dict[str,Any]:
+    company_name = extract_target_company(query)
+    ticker = get_ticker(company_name) or "B"
+
+    yahoo_data = fetch_yahoo_ownership(ticker)
+    fintel_data = fetch_fintel_ownership(ticker)
+    google_news = fetch_google_news(company_name)
+
+    merged_events = merge_ownership_data(yahoo_data, fintel_data, google_news)
+
+    merged_graph = Graph()
+    merged_graph.bind("ex", EX)
+    merged_graph.bind("exr", EXR)
+    weaviate_objects = []
+
+    for evt in merged_events:
+        rdf_g = json_to_rdf(evt)
+        merged_graph += rdf_g
+        kg_ids = [str(s) for s in rdf_g.subjects()]
+        triples = [str(t) for t in rdf_g]
+        weaviate_objects.append(build_weaviate_object(evt, kg_ids, triples))
+
+    majority = [e for e in merged_events if e['relationship_tag']=="majority"]
+    minority = [e for e in merged_events if e['relationship_tag']=="minority"]
+    summary = f"Majority stakes: {len(majority)} | Minority stakes: {len(minority)}"
+
+    return {
+        "json_events": merged_events,
+        "rdf_turtle": merged_graph.serialize(format="turtle").decode("utf-8") if hasattr(merged_graph.serialize(format="turtle"), "decode") else merged_graph.serialize(format="turtle"),
+        "weaviate_objects": weaviate_objects,
+        "summary": summary
+    }
+
+# -------------------------
+# 12. Test
+# -------------------------
+if __name__ == "__main__":
+    query = "BlackRock investments in Company B"
+    output = process_query(query)
+    print("=== JSON Events ===")
+    print(json.dumps(output['json_events'], indent=2))
+    print("\n=== RDF Turtle Preview ===")
+    print(output['rdf_turtle'][:500] + "...\n")
+    print("=== Weaviate Objects Preview ===")
+    print(json.dumps(output['weaviate_objects'], indent=2)[:500] + "...\n")
+    print("=== Summary ===")
+    print(output['summary'])
