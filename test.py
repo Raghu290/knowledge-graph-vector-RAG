@@ -148,3 +148,56 @@ ORDER BY ?date
 """
 
 print(run_sparql(g_all, query_after_date))
+
+
+-------------
+# Dynamic SPARQL generation
+def generate_sparql_from_question(question):
+    prompt = f"""
+PREFIX : <http://example.org/investment#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+Classes:
+:OwnershipRelation  
+:Investor  
+:Company  
+
+Predicates:
+:investor (OwnershipRelation → Investor)  
+:company (OwnershipRelation → Company)  
+:percentage (OwnershipRelation → decimal)  
+:investmentDate (OwnershipRelation → date)  
+:source_url (OwnershipRelation → string)  
+rdfs:label (Investor/Company → string)
+
+Generate a SPARQL query that answers the following question:
+\"\"\"{question}\"\"\"
+Return ONLY the SPARQL query.
+"""
+    response = gemini_model.generate_content(prompt)
+    return response.text.strip()
+
+
+# Hybrid retrieval
+def hybrid_answer(user_question):
+    sparql_query = generate_sparql_from_question(user_question)
+    structured_results = g_all.query(sparql_query)
+    structured_facts = list(structured_results)
+
+    vector_results = weaviate_client.query.get(
+        "OwnershipRelation", ["investor", "company", "percentage", "investmentDate", "source_url"]
+    ).with_near_text({"concepts": [user_question]}).with_limit(5).do()
+
+    context = f"Structured Facts:\n{structured_facts}\n\nVector Context:\n{vector_results}"
+    final_prompt = f"""
+Given the following information from two sources:
+
+{context}
+
+Answer the user’s question: \"{user_question}\".
+List major and minority stakeholders, investment percentages, and dates.
+Cite sources where possible using the provided source URLs.
+"""
+    llm_response = gemini_model.generate_content(final_prompt)
+    return llm_response.text
