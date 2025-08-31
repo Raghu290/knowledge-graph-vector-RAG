@@ -84,3 +84,67 @@ def fetch_fintel_ownership(ticker: str) -> List[Dict[str, Any]]:
         return []
 
 print(fetch_fintel_ownership('DBX'))
+
+
+# 1. All investors for a given company
+query_investors_for_company = """
+PREFIX : <http://example.org/investment#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+SELECT ?investorName ?percentage ?date ?source
+WHERE {
+    ?rel a :OwnershipRelation ;
+         :company :Dropbox ;
+         :investor ?investor ;
+         :percentage ?percentage ;
+         :investmentDate ?date ;
+         :source_url ?source .
+    ?investor rdfs:label ?investorName .
+}
+ORDER BY DESC(?percentage)
+"""
+
+print(run_sparql(g_all, query_investors_for_company))
+
+
+# 2. Companies where BlackRock has majority control
+query_majority_blackrock = """
+PREFIX : <http://example.org/investment#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+SELECT ?companyName ?percentage ?date
+WHERE {
+    ?rel a :OwnershipRelation ;
+         :investor :BlackRock ;
+         :company ?company ;
+         :percentage ?percentage ;
+         :investmentDate ?date .
+    ?company rdfs:label ?companyName .
+    FILTER(xsd:decimal(?percentage) > 50)
+}
+ORDER BY DESC(?percentage)
+"""
+
+print(run_sparql(g_all, query_majority_blackrock))
+
+
+# 3. Investments after a given date
+query_after_date = """
+PREFIX : <http://example.org/investment#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+SELECT ?investorName ?companyName ?percentage ?date
+WHERE {
+    ?rel a :OwnershipRelation ;
+         :investor ?investor ;
+         :company ?company ;
+         :percentage ?percentage ;
+         :investmentDate ?date .
+    ?investor rdfs:label ?investorName .
+    ?company rdfs:label ?companyName .
+    FILTER(xsd:date(?date) > "2023-01-01"^^xsd:date)
+}
+ORDER BY ?date
+"""
+
+print(run_sparql(g_all, query_after_date))
