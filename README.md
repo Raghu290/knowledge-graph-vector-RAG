@@ -135,3 +135,65 @@ It’s not a full semantic reasoner — you’ll need either:
 An external RDF reasoner before loading data, or
 
 Custom Cypher queries to mimic inference.
+
+
+
+if you only have Neo4j Community Edition (no multi-database support), you can use a vertex attribute (or label) to keep two graphs from colliding inside the same database.
+
+Here’s how you can do it:
+
+1️⃣ Use a graphId Property
+
+Assign each node (vertex) and relationship an attribute that identifies which graph it belongs to.
+
+Creating data for Graph 1:
+CREATE (:Person {graphId: "graph1", name: "Alice"});
+CREATE (:City   {graphId: "graph1", name: "Paris"});
+
+Creating data for Graph 2:
+CREATE (:Person {graphId: "graph2", name: "Bob"});
+CREATE (:City   {graphId: "graph2", name: "London"});
+
+2️⃣ Query Only One Graph
+
+Graph 1:
+
+MATCH (n {graphId: "graph1"})
+RETURN n;
+
+
+Graph 2:
+
+MATCH (n {graphId: "graph2"})
+RETURN n;
+
+3️⃣ Use Labels for Separation
+
+You can also add labels to nodes so queries are faster.
+
+Graph 1:
+
+CREATE (:Graph1:Person {name: "Alice"});
+
+
+Graph 2:
+
+CREATE (:Graph2:Person {name: "Bob"});
+
+
+Query Graph 1:
+
+MATCH (n:Graph1) RETURN n;
+
+
+Query Graph 2:
+
+MATCH (n:Graph2) RETURN n;
+
+4️⃣ Relationships Separation
+
+If you create relationships, also tag them:
+
+MATCH (a:Person {name: "Alice"}), (c:City {name: "Paris"})
+CREATE (a)-[:LIVES_IN {graphId: "graph1"}]->(c);
+
